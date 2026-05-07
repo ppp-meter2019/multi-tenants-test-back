@@ -20,22 +20,9 @@ source .env/bin/activate
 export DJANGO_SETTINGS_MODULE=$DJANGO_SETTINGS_MODULE
 export PYTHONPATH=$DJANGODIR:$PYTHONPATH
 
-# --- Production env vars (edit before deploy) -----------------------------
-export DJANGO_SECRET_KEY="replace-me-with-a-long-random-string"
-export DJANGO_DEBUG=0
-export DJANGO_ALLOWED_HOSTS=".example.com,example.com"
-export DJANGO_CSRF_TRUSTED_ORIGINS="https://example.com,https://*.example.com"
-export DJANGO_BEHIND_TLS_PROXY=1
-
-# Same-origin behind nginx → CORS off.
-export DJANGO_CORS_ALLOW_ALL=0
-
-export DB_NAME=tenants_back
-export DB_USER=tenants_back
-export DB_PASSWORD=replace-me
-export DB_HOST=127.0.0.1
-export DB_PORT=5432
-# --------------------------------------------------------------------------
+# All production-specific values (SECRET_KEY, ALLOWED_HOSTS, CSRF_TRUSTED_ORIGINS,
+# CORS rules, DB credentials, …) live in tenants_back/settings_local.py — copy it
+# from tenants_back/settings_local.py.example before first start.
 
 echo "export done"
 

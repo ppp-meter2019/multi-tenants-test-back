@@ -5,13 +5,13 @@
 
 Артефакти, що поряд:
 
-| Файл                  | Призначення                                                            |
-|-----------------------|------------------------------------------------------------------------|
-| `nginx.example.conf`  | віртуальний хост (apex + wildcard сабдомени)                           |
-| **`../bin/gunicorn_start.sh`** | bash-launcher для supervisor — основний шлях, inline `export` |
-| `gunicorn.conf.py`    | конфіг gunicorn у Python-формі — для systemd-варіанту                  |
-| `gunicorn.service`    | альтернатива через systemd                                             |
-| `tenants_back.env`    | шаблон env-файлу — використовується **лише** з systemd                 |
+| Файл                                                          | Призначення                                                  |
+|---------------------------------------------------------------|--------------------------------------------------------------|
+| `nginx.example.conf`                                          | віртуальний хост (apex + wildcard сабдомени)                 |
+| **`../bin/gunicorn_start.sh`**                                | bash-launcher для supervisor — основний шлях                 |
+| **`../tenants_back/settings_local.py.example`**               | шаблон прод-overrides — копіюємо як `settings_local.py`      |
+| `gunicorn.conf.py`                                            | конфіг gunicorn у Python-формі — для systemd-варіанту        |
+| `gunicorn.service`                                            | альтернатива через systemd                                   |
 
 ---
 
@@ -52,23 +52,33 @@ sudo install -d -o webmaster -g www-data -m 750 /home/webmaster/tenants_back/run
 
 ## 3. Основний шлях — supervisor + `bin/gunicorn_start.sh`
 
-### 3.1 Заповнити прод-значення у скрипті
+### 3.1 Прод-значення живуть у `settings_local.py`
 
-`bin/gunicorn_start.sh` тримає `export DJANGO_*` / `DB_*` **прямо в
-тілі скрипта** — без зовнішніх env-файлів. Перед деплоєм відредагуй
-блок `--- Production env vars ---`:
+`bin/gunicorn_start.sh` сам по собі **не містить** ні `SECRET_KEY`, ні
+`ALLOWED_HOSTS`, ні DB-кредів. Усе це йде в окремий Python-файл, який
+підвантажується наприкінці `tenants_back/settings.py`:
 
-```bash
-export DJANGO_SECRET_KEY="..."          # openssl rand -hex 50
-export DJANGO_DEBUG=0
-export DJANGO_ALLOWED_HOSTS=".example.com,example.com"
-export DJANGO_CSRF_TRUSTED_ORIGINS="https://example.com,https://*.example.com"
-export DJANGO_BEHIND_TLS_PROXY=1
-export DJANGO_CORS_ALLOW_ALL=0          # за nginx CORS не потрібен
-export DB_PASSWORD="..."                # реальний пароль
+```python
+try:
+    from .settings_local import *
+except ImportError:
+    print("Can't load local settings!")
 ```
 
-Решта прапорів gunicorn у самому `exec`:
+Перед першим запуском скопіюй шаблон і відредагуй:
+
+```bash
+cd /home/webmaster/tenants_back
+cp tenants_back/settings_local.py.example tenants_back/settings_local.py
+nano tenants_back/settings_local.py           # SECRET_KEY, домен, DB_PASSWORD
+```
+
+`settings_local.py` обов'язково додай у `.gitignore`:
+```
+tenants_back/tenants_back/settings_local.py
+```
+
+Прапори gunicorn у самому `exec`:
 
 | Прапор                  | Що робить                                                |
 |-------------------------|----------------------------------------------------------|
@@ -138,19 +148,31 @@ sudo supervisorctl restart tenants_back
 sudo ln -s /etc/nginx/sites-available/tenants.conf /etc/nginx/sites-enabled/
 sudo nginx -t
 sudo systemctl reload nginx
+sudo ufw allow 8000/tcp     # відкрити публічний API-порт
 ```
 
-Ключове в шаблоні:
+Архітектура — **два `server`-блоки з одним wildcard-сертифікатом**:
 
-- `server_name example.com *.example.com;` — один `server { ... }` ловить
-  apex і всі сабдомени.
-- `upstream tenants_back { server unix:/home/webmaster/tenants_back/run/gunicorn.sock; }`
-  — той самий шлях, що в bin-скрипті.
-- `location ~ ^/(api|admin)/` → проксі на gunicorn із збереженим `Host`.
-  django-tenants дивиться саме на `Host`, щоб обрати схему.
-- `location /static/` → `alias /home/webmaster/tenants_back/staticfiles/`.
-- `location /` → `root /home/webmaster/tenants_front; try_files $uri $uri/ /index.html;`
-  (SPA-фолбек).
+| Порт  | Що віддає                                     | `location` блоки                                    |
+|-------|------------------------------------------------|------------------------------------------------------|
+| `:443`  | SPA + Django admin + статика                  | `/` → SPA, `/admin/` → gunicorn, `/static/` → alias |
+| `:8000` | Публічний API (для фронта і зовнішніх клієнтів) | `/api/` → gunicorn, `/` → 404                        |
+
+Обидва `server`-блоки проксують у той самий gunicorn-сокет
+`unix:/home/webmaster/tenants_back/run/gunicorn.sock` і обов'язково
+передають `proxy_set_header Host $host;` — `TenantMainMiddleware`
+маршрутизує саме за `Host` (порт у виборі схеми участі не бере).
+
+Що це дає:
+- Фронт із `https://alpha.example.com` стукається на
+  `https://alpha.example.com:8000/api/...` (cross-origin, тому в Django
+  активний `CORS_ALLOWED_ORIGIN_REGEXES` для всіх `*.example.com`).
+- Зовнішні клієнти (curl, мобілка, чужі бекенди) ходять на той самий
+  `https://<тенант>.example.com:8000/api/...`.
+- Django admin лишається на 443 — публічний API-порт чистий.
+
+Якщо хочеш усе на 443 без окремого API-порта — прибери `server { listen 8000 ssl; ... }`
+блок із конфігу і постав у `tenants_front/config.js` `API_PORT = ""`.
 
 ---
 
@@ -172,21 +194,17 @@ sudo certbot certonly --dns-cloudflare \
 ## 6. Альтернатива — systemd замість supervisor
 
 Якщо supervisor не використовуєте, є готовий юніт `gunicorn.service` +
-`gunicorn.conf.py`. У цьому варіанті env-змінні читаються з
-`tenants_back.env` (окремий файл, бо саме так systemd інтегрує env
-найчистіше — `EnvironmentFile=...`).
+`gunicorn.conf.py`. Налаштування Django (`SECRET_KEY`, `ALLOWED_HOSTS`,
+DB, CORS) і тут живуть у `tenants_back/settings_local.py` — однаково з
+supervisor-варіантом.
 
 ```bash
 sudo cp /home/webmaster/tenants_back/deploy/gunicorn.service /etc/systemd/system/tenants_back.service
-sudo cp /home/webmaster/tenants_back/deploy/tenants_back.env /etc/tenants_back.env
-sudo chown root:webmaster /etc/tenants_back.env
-sudo chmod 640 /etc/tenants_back.env
-# заповни секрети у /etc/tenants_back.env
 sudo systemctl daemon-reload
 sudo systemctl enable --now tenants_back
 ```
 
-`gunicorn.service` тримає `RuntimeDirectory=tenants_back` і biнд на
+`gunicorn.service` тримає `RuntimeDirectory=tenants_back` і bіnd на
 `/run/tenants_back.sock` — у цьому варіанті оновіть `nginx.example.conf`:
 
 ```nginx

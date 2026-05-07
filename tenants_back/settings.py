@@ -217,6 +217,11 @@ CORS_ALLOW_ALL_ORIGINS = os.environ.get("DJANGO_CORS_ALLOW_ALL", "1") == "1"
 CORS_ALLOWED_ORIGINS = [
     o.strip() for o in os.environ.get("DJANGO_CORS_ALLOWED_ORIGINS", "").split(",") if o.strip()
 ]
+# Use this to whitelist a wildcard, e.g. all your tenant subdomains:
+#   DJANGO_CORS_ALLOWED_ORIGIN_REGEXES=^https://([a-z0-9-]+\.)?example\.com(:\d+)?$
+CORS_ALLOWED_ORIGIN_REGEXES = [
+    r.strip() for r in os.environ.get("DJANGO_CORS_ALLOWED_ORIGIN_REGEXES", "").split(",") if r.strip()
+]
 CORS_ALLOW_CREDENTIALS = False
 
 
