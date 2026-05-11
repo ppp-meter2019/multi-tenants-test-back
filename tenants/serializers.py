@@ -1,5 +1,8 @@
 from django.db import transaction
+from django_tenants.utils import schema_context
 from rest_framework import serializers
+
+from users.models import User
 
 from .models import Domain, Tenant
 
@@ -19,6 +22,7 @@ class TenantSerializer(serializers.ModelSerializer):
 
     domain = serializers.CharField(write_only=True, required=True)
     domains = DomainSerializer(many=True, read_only=True)
+    admins = serializers.SerializerMethodField()
 
     class Meta:
         model = Tenant
@@ -30,8 +34,29 @@ class TenantSerializer(serializers.ModelSerializer):
             "is_active",
             "domain",
             "domains",
+            "admins",
         ]
-        read_only_fields = ["id", "created_on", "domains"]
+        read_only_fields = ["id", "created_on", "domains", "admins"]
+
+    def get_admins(self, obj: Tenant) -> list:
+        """List of company-admin usernames inside the tenant's schema.
+
+        Implemented as one extra query per tenant (switches search_path via
+        `schema_context`). Cheap for a tens-of-tenants admin UI; if you ever
+        get hundreds of tenants, replace with a single cross-schema raw SQL
+        query.
+        """
+        try:
+            with schema_context(obj.schema_name):
+                return list(
+                    User.objects.filter(role=User.Role.COMPANY_ADMIN)
+                    .order_by("username")
+                    .values("id", "username", "is_active")
+                )
+        except Exception:
+            # Якщо тенантна схема пошкоджена / ще не migrated — не валимо
+            # листинг усіх тенантів, просто повертаємо порожньо.
+            return []
 
     def validate_schema_name(self, value: str) -> str:
         value = value.strip().lower()
