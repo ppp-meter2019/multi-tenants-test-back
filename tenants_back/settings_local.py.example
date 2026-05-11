@@ -36,14 +36,13 @@ SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
 SESSION_COOKIE_SECURE = True
 CSRF_COOKIE_SECURE = True
 
-# Required for Django admin POST behind TLS proxy. Include the API port (8000)
-# because the SPA submits requests from there.
+# Required for Django admin POST behind TLS proxy. Django (admin + api) живе
+# тільки на :8000 → достатньо origin'ів із цим портом. Apex (`https://example.com:8000`)
+# для tenant-адміна; wildcard — для company-admin'ів кожного тенанта.
 CSRF_TRUSTED_ORIGINS = [
-    "https://example.com",
-    "https://*.example.com",
+    "https://example.com:8000",
     "https://*.example.com:8000",
 ]
-
 
 # --------------------------------------------------------------------------
 # CORS — frontend at https://<sub>.example.com calls API on

@@ -695,7 +695,180 @@ curl -s -X POST http://alpha.localhost:8000/api/products/ \
 
 ---
 
-## 15. Project layout
+## 15. (Опційно) Підтримка PostGIS
+
+Якщо проекту потрібні геометричні типи (`Point`, `LineString`, `Polygon`),
+spatial-індекси і GIS-запити у БД (`distance_lte`, `within`, ...) — нижче
+покроковий алгоритм. Якщо досить просто зберігати координати + рахувати
+дистанції в Python — пропусти цей розділ і використай
+`DecimalField(lat) + DecimalField(lng)`.
+
+### 15.1 Системні залежності на сервері
+
+```bash
+sudo apt update
+sudo apt install -y binutils libproj-dev gdal-bin libgdal-dev libgeos-dev libgeos++-dev
+```
+
+### 15.2 Увімкнути PostGIS у БД
+
+Підключись як master (`ubuntu` має `rds_superuser`, потрібний для
+`CREATE EXTENSION`):
+
+```bash
+PGPASSWORD='<master-pass>' psql -h <rds-endpoint> -U ubuntu -d tenants_back
+```
+
+```sql
+CREATE EXTENSION IF NOT EXISTS postgis;
+SELECT PostGIS_Version();        -- перевірка: має повернути версію 3.x
+
+-- Якщо public ще не належить tenants_back — хоча б видай grant:
+GRANT USAGE ON SCHEMA public TO tenants_back;
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO tenants_back;
+\q
+```
+
+### 15.3 Налаштувати Django через `ORIGINAL_BACKEND`
+
+`django-tenants` має офіційну settings-змінну, яка переключає базовий
+backend із звичайного PostgreSQL на PostGIS. **Кастомний backend із
+multiple inheritance не потрібен.**
+
+У `tenants_back/settings.py`:
+
+```python
+DATABASES = {
+    "default": {
+        "ENGINE": "django_tenants.postgresql_backend",   # ← лишається той самий
+        # NAME / USER / PASSWORD / HOST / PORT — без змін
+    }
+}
+
+# Нова стрічка: говорить django-tenants успадковуватись від PostGIS-backend
+# замість стандартного PostgreSQL.
+ORIGINAL_BACKEND = "django.contrib.gis.db.backends.postgis"
+
+# Додай django.contrib.gis у SHARED_APPS:
+SHARED_APPS = [
+    "django_tenants",
+    "tenants",
+
+    "django.contrib.contenttypes",
+    "django.contrib.auth",
+    "django.contrib.gis",          # ← новий рядок
+    "django.contrib.sessions",
+    "django.contrib.messages",
+    "django.contrib.staticfiles",
+    "django.contrib.admin",
+
+    "rest_framework",
+    "rest_framework_simplejwt",
+    "corsheaders",
+
+    "users",
+]
+# TENANT_APPS не чіпаємо.
+```
+
+### 15.4 Додати гео-поля у моделі
+
+Імпорти GIS-полів — окремі, з `django.contrib.gis.db.models`:
+
+```python
+# routes/models.py
+from django.contrib.gis.db import models as gis_models
+from django.db import models
+
+
+class Route(models.Model):
+    name = models.CharField(max_length=120)
+    # ... існуючі поля ...
+
+    start_point = gis_models.PointField(geography=True, null=True, blank=True)
+    path = gis_models.LineStringField(geography=True, null=True, blank=True)
+```
+
+### 15.5 Згенерувати міграції
+
+```bash
+source .env/bin/activate
+python manage.py makemigrations routes
+```
+
+Відкрий згенерований файл. Якщо у списку `operations` побачиш:
+
+```python
+migrations.CreateExtension('postgis'),
+```
+
+**прибери цей рядок**. У Aurora роль `tenants_back` не має
+`rds_superuser` → виконання впаде з `permission denied`. Extension ми
+вже створили руками master-юзером у кроці 15.2.
+
+### 15.6 Накотити міграції
+
+```bash
+python manage.py migrate_schemas
+```
+
+### 15.7 Зібрати статику адмінки
+
+```bash
+python manage.py collectstatic --noinput
+sudo supervisorctl restart tenants_back
+```
+
+GeoDjango додає OpenLayers-віджет у Django admin для гео-полів — його
+CSS/JS потрапить у `staticfiles/` через `collectstatic`.
+
+### 15.8 Перевірити в БД
+
+```bash
+PGPASSWORD='<секрет>' psql -h <rds-endpoint> -U tenants_back -d tenants_back
+```
+
+```sql
+\dx                            -- має бути postgis у списку
+SET search_path TO alpha, public;
+SELECT 'POINT(30.5 50.4)'::geometry;   -- тип резолвиться з public
+
+\d alpha.routes_route          -- гео-колонки серед полів
+\di alpha.routes_route_*       -- GiST-індекси (Django GIS їх створює автоматично)
+```
+
+### 15.9 Тонкі моменти
+
+| #  | Гачок                                                          | Деталь                                                                                                                                  |
+|----|-----------------------------------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------|
+| 1  | **`ORIGINAL_BACKEND` ≠ `ENGINE`**                               | `ENGINE` лишається `django_tenants.postgresql_backend`. Якщо змінити саме `ENGINE` на postgis-варіант — мульти-тенантність зламається.   |
+| 2  | **PostGIS extension живе тільки в `public`**                    | Не треба `CREATE EXTENSION postgis` у кожній тенантній схемі. Тип `geometry` резолвиться через search_path → `<тенант>, public` → знаходить у public. |
+| 3  | **`django.contrib.gis` — у SHARED_APPS, не в TENANT_APPS**      | Це бібліотека з полями + GIS ORM, без власних DB-моделей. У TENANT_APPS додавати нема сенсу.                                            |
+| 4  | **`CreateExtension` у міграції Django**                         | Django може автоматично додати `migrations.CreateExtension('postgis')` у файл після першої `makemigrations`. Aurora-роль `tenants_back` цього не виконає. Видаляєш рядок з міграції — extension вже на місці з кроку 15.2. |
+| 5  | **Extra-схеми від PostGIS (`tiger`, `topology`, `tiger_data`)** | Якщо ставив повний набір (`postgis_topology`, `postgis_tiger_geocoder`), вони існуватимуть у БД як окремі схеми. Власник — `rdsadmin`. Це нормально; вони видимі тенантам через search_path, але django-tenants ними не керує. |
+| 6  | **`geography=True` vs `geography=False`**                       | `True` — координати на сфері WGS84, точні відстані глобально, повільніше. `False` (= `geometry`) — площинні, швидше, але дистанції викривлені поза малими регіонами. Для логістики в одній країні `geography=True` природніше. |
+| 7  | **DRF не серіалізує геометрію з коробки**                       | Стандартний `ModelSerializer` падає на `PointField`. Якщо плануєш віддавати гео-поля через API — серіалізуй вручну (`point.x`, `point.y` як два DecimalField-и) або візьми окремий пакет з GIS-серіалайзерами. |
+| 8  | **OpenLayers-віджет у адмінці на гео-полях**                    | Django admin за замовчуванням рендерить великий інтерактивний мапа-віджет на `PointField`. Якщо це не треба — у `ModelAdmin` перевизнач `formfield_overrides` на простий `TextField`-widget. |
+| 9  | **Rollback гео-поля втратить дані**                             | Зворотній `RemoveField` для `PointField` дропає колонку. Якщо колись треба буде відкатити — спершу зроби data-migration, що зберігає `ST_AsText(field)` у звичайну текстову колонку. |
+| 10 | **`auto_create_schema=True` клонує `template1`**                | Нова тенантна схема НЕ дістає extensions автоматично — і це нормально, бо ми тримаємо postgis тільки в public. Якщо колись захочеш кожному тенанту окремий postgis — постав extension у `template1` ДО створення першого тенанта. |
+| 11 | **Upgrade Aurora major version може зачепити PostGIS**          | При переході PG 14 → 15 Aurora не оновлює PostGIS автоматично. Перед major upgrade зроби `SELECT postgis_extensions_upgrade();` у БД. Краще описано в AWS docs «Upgrading PostGIS». |
+
+### 15.10 Швидкий чеклист
+
+- [ ] `apt install -y binutils libproj-dev gdal-bin libgdal-dev libgeos-dev libgeos++-dev`
+- [ ] `CREATE EXTENSION postgis` виконано як master, `PostGIS_Version()` повертає версію
+- [ ] У `settings.py` додано `ORIGINAL_BACKEND = "django.contrib.gis.db.backends.postgis"`
+- [ ] `django.contrib.gis` додано у `SHARED_APPS`
+- [ ] `ENGINE` лишився `django_tenants.postgresql_backend` (НЕ змінювали)
+- [ ] Гео-поля додано в моделі
+- [ ] `CreateExtension('postgis')` прибрано зі згенерованої міграції
+- [ ] `migrate_schemas` пройшов чисто
+- [ ] `\d <schema>.<table>` показує гео-колонки + GIST-індекс
+- [ ] `collectstatic` зібрав OpenLayers-ассети
+
+---
+
+## 16. Project layout
 
 ```
 tenants_back/

@@ -1,3 +1,4 @@
+from django.contrib.gis.db import models as gis_models
 from django.core.validators import MinValueValidator
 from django.db import models
 
@@ -24,6 +25,10 @@ class Order(models.Model):
         default=Status.PLACED,
     )
     created_at = models.DateTimeField(auto_now_add=True)
+
+    # Доставка — обидва поля необов'язкові, додані для верифікації PostGIS-зв'язки.
+    delivery_address = models.TextField(blank=True, default="")
+    delivery_point = gis_models.PointField(geography=True, null=True, blank=True)
 
     class Meta:
         ordering = ("-created_at",)

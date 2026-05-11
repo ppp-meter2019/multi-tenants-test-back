@@ -50,6 +50,12 @@ SHARED_APPS = [
 
     "django.contrib.contenttypes",
     "django.contrib.auth",
+    # PostGIS: бібліотека з гео-полями + GIS ORM. Без своїх таблиць — їй
+    # вистачає одного запису в SHARED_APPS (у TENANT_APPS не дублюємо).
+    # Вимагає системних gdal/geos/proj і `CREATE EXTENSION postgis` у БД —
+    # див. README §15. Якщо PostGIS поки не налаштовано — закоментуй рядок,
+    # інакше Django впаде на імпорті GIS-модулів.
+    "django.contrib.gis",
     "django.contrib.sessions",
     "django.contrib.messages",
     "django.contrib.staticfiles",
@@ -92,6 +98,14 @@ PUBLIC_SCHEMA_URLCONF = "tenants_back.urls_public"
 ROOT_URLCONF = "tenants_back.urls_tenant"
 
 DATABASE_ROUTERS = ("django_tenants.routers.TenantSyncRouter",)
+
+# PostGIS: вказує django-tenants успадковуватись від PostGIS-backend замість
+# стандартного PostgreSQL. Дає одночасно мульти-тенантність і GIS типи /
+# spatial-індекси / GIS ORM. Вимагає `CREATE EXTENSION postgis` у БД +
+# системних gdal/geos/proj — див. README §15. Якщо PostGIS не налаштовано,
+# закоментуй цей рядок (тоді django-tenants підхопить дефолт
+# `django.db.backends.postgresql`).
+ORIGINAL_BACKEND = "django.contrib.gis.db.backends.postgis"
 
 
 # ---------------------------------------------------------------------------

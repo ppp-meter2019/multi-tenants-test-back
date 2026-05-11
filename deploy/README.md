@@ -153,15 +153,16 @@ sudo ufw allow 8000/tcp     # відкрити публічний API-порт
 
 Архітектура — **два `server`-блоки з одним wildcard-сертифікатом**:
 
-| Порт  | Що віддає                                     | `location` блоки                                    |
-|-------|------------------------------------------------|------------------------------------------------------|
-| `:443`  | SPA + Django admin + статика                  | `/` → SPA, `/admin/` → gunicorn, `/static/` → alias |
-| `:8000` | Публічний API (для фронта і зовнішніх клієнтів) | `/api/` → gunicorn, `/` → 404                        |
+| Порт    | Що віддає                                              | `location` блоки                                                                  |
+|---------|--------------------------------------------------------|------------------------------------------------------------------------------------|
+| `:443`  | Тільки SPA-фронт                                       | `/` → SPA (`try_files $uri /index.html =404`)                                      |
+| `:8000` | Публічний Django: API + admin + статика для адмінки    | `/api/` → gunicorn, `/admin/` → gunicorn, `/static/` → alias, `/` → 404            |
 
-Обидва `server`-блоки проксують у той самий gunicorn-сокет
-`unix:/home/webmaster/tenants_back/run/gunicorn.sock` і обов'язково
-передають `proxy_set_header Host $host;` — `TenantMainMiddleware`
-маршрутизує саме за `Host` (порт у виборі схеми участі не бере).
+`:443` Django **не торкається** — Django (включно з адмінкою) живе
+**виключно** на `:8000`. `:8000` проксує у gunicorn-сокет
+`unix:/home/webmaster/tenants_back/run/gunicorn.sock` із обов'язковим
+`proxy_set_header Host $host;` — `TenantMainMiddleware` маршрутизує
+саме за `Host` (порт у виборі схеми участі не бере).
 
 Що це дає:
 - Фронт із `https://alpha.example.com` стукається на
@@ -169,7 +170,12 @@ sudo ufw allow 8000/tcp     # відкрити публічний API-порт
   активний `CORS_ALLOWED_ORIGIN_REGEXES` для всіх `*.example.com`).
 - Зовнішні клієнти (curl, мобілка, чужі бекенди) ходять на той самий
   `https://<тенант>.example.com:8000/api/...`.
-- Django admin лишається на 443 — публічний API-порт чистий.
+- Django admin доступний на `https://<тенант>.example.com:8000/admin/`.
+  Для tenant-адміна — `https://example.com:8000/admin/` (apex без сабдомена).
+  CSRF для цього порту покритий — у `settings_local.py`
+  `CSRF_TRUSTED_ORIGINS` має `https://*.example.com:8000`.
+- Сайт-фронт чистіший: 443-ій порт не проксує **жодного** Django-шляху,
+  не «знає» про `/admin/`, нічого зайвого не експонує.
 
 Якщо хочеш усе на 443 без окремого API-порта — прибери `server { listen 8000 ssl; ... }`
 блок із конфігу і постав у `tenants_front/config.js` `API_PORT = ""`.
