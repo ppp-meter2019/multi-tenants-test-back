@@ -27,6 +27,15 @@ pip install -r requirements.txt
 
 ## 2. Database
 
+Multi-tenant потребує PostgreSQL (django-tenants не працює з SQLite). У
+розділі два сценарії: швидкий для локального дева (§2.1) і повний для
+прод-розгортання на RDS/Aurora з перевіркою доступів (§2.2-§2.10).
+
+### 2.1 Швидкий локальний dev
+
+Для розробки на своїй машині достатньо одного superuser-юзера і одної
+БД:
+
 ```sql
 CREATE USER postgres WITH SUPERUSER PASSWORD 'postgres';
 CREATE DATABASE tenants_back OWNER postgres;
@@ -34,7 +43,195 @@ CREATE DATABASE tenants_back OWNER postgres;
 
 Креденшіали можна перевизначити env-змінними (`DB_NAME`, `DB_USER`,
 `DB_PASSWORD`, `DB_HOST`, `DB_PORT`) — за замовчуванням
-`postgres / postgres @ 127.0.0.1:5432`.
+`postgres / postgres @ 127.0.0.1:5432`. Для дева перевірка доступів,
+окрема роль і власник схеми не потрібні — superuser може все.
+
+### 2.2 Передумови (production)
+
+Далі — повний цикл для прод-розгортання: від чистого RDS/Aurora-кластера
+до робочої БД, в яку Django зможе мігрувати схеми. Алгоритм підходить і
+для self-hosted PostgreSQL — відрізняються лише деталі підключення
+в §2.3.
+
+- AWS Aurora PostgreSQL (або звичайний PostgreSQL 13+) уже піднятий.
+- У тебе є endpoint, master-user (наприклад, `ubuntu`) і його пароль.
+- На сервері застосунку встановлений `psql`:
+  ```bash
+  sudo apt install -y postgresql-client
+  ```
+- (Для Aurora) Security Group дозволяє inbound 5432 з IP сервера застосунку:
+  ```bash
+  nc -zv <rds-endpoint> 5432            # має відповісти "succeeded"
+  ```
+
+### 2.3 Підключитись як master
+
+```bash
+PGPASSWORD='<master-pass>' psql -h <rds-endpoint> -U ubuntu -d postgres
+```
+
+> Альтернатива з інтерактивним вводом — без `PGPASSWORD`-префікса; не лишає
+> пароль у `~/.bash_history`.
+
+### 2.4 Створити роль і БД
+
+```sql
+-- 1. Окрема роль для застосунку (НЕ master).
+CREATE ROLE tenants_back WITH LOGIN PASSWORD '<секрет>';
+
+-- 2. Дати master-юзеру тимчасове членство в новій ролі.
+--    Без цього CREATE DATABASE з OWNER іншої ролі падає в Aurora з
+--    помилкою «must be member of role».
+GRANT tenants_back TO ubuntu;
+
+-- 3. Сама БД.
+CREATE DATABASE tenants_back OWNER tenants_back ENCODING 'UTF8';
+
+-- 4. Прибрати тимчасове членство (опційно, для гігієни).
+REVOKE tenants_back FROM ubuntu;
+```
+
+### 2.5 Передати `public` схему у власність застосунку
+
+Aurora створює нову БД зі схемою `public`, власник якої — master. У PG 14
+це поки не блокує `tenants_back` від створення там таблиць, але **у PG 15+
+тільки власник схеми може створювати в ній об'єкти**. Передаємо власність
+наперед — щоб майбутній upgrade Aurora нічого не зламав:
+
+```bash
+PGPASSWORD='<master-pass>' psql -h <rds-endpoint> -U ubuntu -d tenants_back
+```
+
+```sql
+ALTER SCHEMA public OWNER TO tenants_back;
+\dn
+--   Name  |    Owner
+-- --------+---------------
+--  public | tenants_back     ← має стати так
+\q
+```
+
+### 2.6 (Опційно) Увімкнути PostGIS
+
+Тільки якщо проект використовує гео-поля (`PointField`, `LineStringField`).
+Виконувати **як master** — `CREATE EXTENSION` потребує `rds_superuser`:
+
+```bash
+PGPASSWORD='<master-pass>' psql -h <rds-endpoint> -U ubuntu -d tenants_back
+```
+
+```sql
+CREATE EXTENSION IF NOT EXISTS postgis;
+SELECT PostGIS_Version();          -- очікуєш 3.x
+GRANT USAGE ON SCHEMA public TO tenants_back;          -- якщо ще не передавали власність
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO tenants_back;
+\q
+```
+
+Повна налагодка PostGIS у Django (`ORIGINAL_BACKEND`, `django.contrib.gis`,
+гео-поля, міграції) — окремо в §15.
+
+### 2.7 Перевірити, що `tenants_back` має всі потрібні доступи
+
+Підключись **уже як новий юзер**:
+
+```bash
+PGPASSWORD='<секрет>' psql -h <rds-endpoint> -U tenants_back -d tenants_back
+```
+
+Чек-лист команд:
+
+```sql
+-- 1) Ідентичність і поточна БД
+SELECT current_user, current_database();
+
+-- 2) Атрибути ролі (login, createdb, superuser, ...)
+\du tenants_back
+
+-- 3) Поточні схеми і їх власники
+\dn
+
+-- 4) Чи можемо створити СХЕМУ — потрібно для auto_create_schema нових тенантів
+CREATE SCHEMA __perm_test;
+DROP SCHEMA __perm_test;
+
+-- 5) Чи можемо створити ТАБЛИЦЮ у public — туди йдуть SHARED_APPS міграції
+CREATE TABLE public.__perm_test (id int);
+INSERT INTO public.__perm_test VALUES (1);
+SELECT count(*) FROM public.__perm_test;     -- → 1
+DROP TABLE public.__perm_test;
+
+-- 6) Чи доступні PostGIS-типи (тільки якщо робили §2.6)
+SELECT 'POINT(30.5 50.4)'::geometry;
+
+-- 7) Привілеї на public (точніший погляд)
+SELECT has_schema_privilege(current_user, 'public', 'CREATE')  AS can_create,
+       has_schema_privilege(current_user, 'public', 'USAGE')   AS can_use;
+
+-- 8) Привілеї на БД (CONNECT, CREATE на рівні БД)
+SELECT has_database_privilege(current_user, current_database(), 'CONNECT') AS can_connect,
+       has_database_privilege(current_user, current_database(), 'CREATE')  AS can_create_schemas,
+       has_database_privilege(current_user, current_database(), 'TEMP')    AS can_temp;
+
+\q
+```
+
+Що має повернути `TRUE`:
+
+| Перевірка                                       | Чому це важливо                                                    |
+|--------------------------------------------------|--------------------------------------------------------------------|
+| `current_user = tenants_back`                    | Підключились правильно                                             |
+| `has_database_privilege ... 'CONNECT'`           | Інакше Django не зможе відкрити з'єднання                          |
+| `has_database_privilege ... 'CREATE'`            | Потрібно для `CREATE SCHEMA <new_tenant>` при `auto_create_schema` |
+| `has_schema_privilege public 'CREATE'`           | Потрібно для SHARED_APPS-міграцій (`auth_user`, `tenants_*`, ...) |
+| `has_schema_privilege public 'USAGE'`            | Доступ до PostGIS-функцій і базових Django-таблиць у public        |
+| `CREATE SCHEMA __perm_test` працює               | Те саме що `CREATE` на БД, але перевірено практично                |
+| `CREATE TABLE public.__perm_test` працює         | Те саме що `CREATE` на public, перевірено практично                |
+| (Якщо PostGIS) `'POINT(...)'::geometry` працює   | PostGIS-extension встановлений і доступний                          |
+
+### 2.8 Якщо щось не пускає
+
+| Симптом у §2.7                                       | Що зробити                                                                                                                       |
+|------------------------------------------------------|----------------------------------------------------------------------------------------------------------------------------------|
+| `permission denied for schema public` у п. 5         | Не передавали власність схеми. Зайти master'ом: `ALTER SCHEMA public OWNER TO tenants_back;` або `GRANT ALL ON SCHEMA public TO tenants_back;` |
+| `permission denied for database tenants_back` у п. 4 | `tenants_back` не власник БД. Зайти master'ом: `ALTER DATABASE tenants_back OWNER TO tenants_back;`                              |
+| `type "geometry" does not exist`                     | Extension не створений. Зайти master'ом: `CREATE EXTENSION postgis;` (§2.6)                                                      |
+| `FATAL: password authentication failed`              | Невірний пароль АБО роль не має `LOGIN`. Master'ом: `ALTER ROLE tenants_back WITH LOGIN PASSWORD '...';`                          |
+| `could not connect ... timeout`                      | RDS Security Group не пускає з твоєї IP. AWS Console → RDS → твій кластер → Security groups → Inbound → додати 5432 з твого CIDR. |
+
+### 2.9 Записати креди в `settings_local.py`
+
+Після успішної перевірки скопіювати плейсхолдери `settings_local.py.example`
+у `settings_local.py` (gitignored) і заповнити реальні значення:
+
+```python
+DATABASES["default"].update({
+    "NAME": "tenants_back",
+    "USER": "tenants_back",
+    "PASSWORD": "<секрет>",
+    "HOST": "<rds-endpoint>",
+    "PORT": "5432",
+})
+```
+
+> **Важливо**: `ENGINE` в `update()` НЕ перевизначаємо — він уже виставлений
+> у `settings.py` як `django_tenants.postgresql_backend`. Для PostGIS-режиму
+> досить `ORIGINAL_BACKEND` (теж у `settings.py`, див. §16).
+
+### 2.10 Перший запуск міграцій
+
+```bash
+cd /home/ubuntu/tenants_back
+source .env/bin/activate
+python manage.py migrate_schemas --shared          # SHARED_APPS у public
+python manage.py bootstrap_public ...              # tenant_admin
+python manage.py bootstrap_tenant --schema alpha ... # перший тенант
+```
+
+Якщо тут падає на `migrate_schemas --shared` із `permission denied`,
+повертайся до §2.7 і знайди, яка з 8 перевірок дала `f` (false).
+
+---
 
 ## 3. Hosts file (тільки для дев)
 
